@@ -1,108 +1,90 @@
-const Common_AddressType =
-{
-    [1]: "IPv4",
-    [2]: "domain",
-    [3]: "IPv6"
-}
+import { Dest, Protocols, NameProtocols } from "./types"
 
-const Common_AddressType_Value = {
-    IPv4: 1,
-    domain: 2,
-    IPv6: 3
-}
+export const isIPv4 = (address: string) => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(address)
+export const isIPv6 = (address: string) => /^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/.test(address)
+export const isDomain = (address: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](?:\.[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9])*$/.test(address)
 
-/**
- * addresstype: 01-->ipv4,02-->domain,03-->ipv6
- * socks5:IPV4: 0x01,domain:03,ipv6:04
- * @param buffer 
- * @param offset 
- * @param address 
- * @returns 
- */
-export function read_address(buffer: Buffer, address: any, offset: number = 0) {
+export function readMetaAddress(meta: Buffer, offset: number = 4) {
 
-    const names =  Common_AddressType
-    const address_type = buffer[offset++]
     //@ts-ignore
-    const name = names[address_type!]
+    const dest: Dest = {}
 
-    switch (name) {
-        case "IPv4":      //ipv4
+    dest.protocol = NameProtocols[meta.readUint8(offset++)]
+    dest.port = meta.readUInt16BE(offset)
+
+    offset += 2
+
+    readAddress(meta, dest, offset)
+
+    return dest
+}
+
+export function readAddress(meta: Buffer, dest: Dest, offset: number) {
+
+    const addressType = meta.readUint8(offset++)
+
+    switch (addressType) {
+        case 0x01:      //ipv4
+            dest.family = "ipv4"
+            dest.host = `${meta[offset++]}.${meta[offset++]}.${meta[offset++]}.${meta[offset++]}`
+            break
+        case 0x02:      //domain
             {
-                address.family = "IPv4"
-                address.host = `${buffer[offset++]}.${buffer[offset++]}.${buffer[offset++]}.${buffer[offset++]}`
+                const size = meta[offset++]
+                dest.family = "domain"
+                dest.host = meta.subarray(offset, offset += size!).toString()
             }
             break
-        case "domain":      //domain
-            {
-                const size = buffer[offset++]
-                address.host = buffer.subarray(offset, offset += size!).toString()
-            }
-            break
-        case "IPv6":      //ipv6
+        case 0x03:      //ipv6
             {
                 const array = []
 
-                for (let i = 0; i < 8; i++) {
-                    array.push(buffer.readUint16BE(offset).toString(16));
-                    offset += 2
+                for (let i = 0; i < 8; i++, offset += 2) {
+                    array.push(meta.readUint16BE(offset).toString(16));
                 }
-                address.family = "IPv6"
-                address.host = array.join(":")
+                dest.family = "ipv6"
+                dest.host = array.join(":")
             }
             break
-        default:
-            address.host = null
-            break
     }
-
-    address.address = address.host
 
     return offset
 }
 
-export function write_address(buffer: Buffer, address: any, offset: number = 0) {
+export function writeMetaAddress(meta: Buffer, dest: Dest, offset: number) {
 
-    const address_type_pos = offset
-    const names = Common_AddressType_Value
+    offset = meta.writeUint8(Protocols[dest.protocol!], offset)
+    offset = meta.writeUInt16BE(dest.port, offset)
 
-    buffer[offset++] = 1
+    return writeAddress(meta, dest, offset)
+}
 
-    switch (address.family) {
-        case "IPv4":
+export function writeAddress(meta: Buffer, dest: Dest, offset: number) {
+
+    switch (dest.family) {
+        case "ipv4":
+            offset = meta.writeUInt8(0x01, offset)
+            dest.host.split(".").forEach(e => offset = meta.writeUInt8(parseInt(e), offset))
+            break
+        case "domain":
             {
-                const array = (address.address || address.host).split(".")
+                const sub = Buffer.from(dest.host)
 
-                for (let i = 0; i < 4; ++i) {
-                    const val = parseInt(array[i])
-                    buffer[offset++] = val
-                }
+                offset = meta.writeUInt8(0x02, offset)
+                offset = meta.writeUInt8(sub.byteLength, offset)
 
-                buffer[address_type_pos] = names["IPv4"]
+                offset += sub.copy(meta, offset)
             }
             break
-        case "IPv6":
+        case "ipv6":
             {
-                const array = (address.address || address.host).split(":")
+                const array = dest.host.split(":")
 
-                for (let i = 0; i < 8; ++i) {
-                    const val = parseInt(array[i], 16)
-                    buffer.writeUint16BE(val, offset)
-                    offset += 2
+                offset = meta.writeUInt8(0x03, offset)
+
+                for (let i = 0; i < array.length; i++) {
+                    offset = meta.writeUInt16BE(parseInt(array[i]!, 16), offset)
                 }
-
-                buffer[address_type_pos] = names["IPv6"]
-            }
-            break
-        default:        //Domain
-            {
-                const sub = Buffer.from((address.address || address.host))
-
-                buffer[offset++] = sub.byteLength
-
-                sub.copy(buffer, offset, 0, offset += sub.byteLength)
-
-                buffer[address_type_pos] = names["domain"]
             }
             break
     }

@@ -1,41 +1,99 @@
 import { stringify, v5, validate } from "uuid"
-import { WebSocketServer, WebSocket, createWebSocketStream } from "ws";
+import { WebSocket, createWebSocketStream, WebSocketServer } from "ws";
 import { createConnection } from "net";
-import { createSocket } from "dgram";
+import { RemoteInfo, createSocket } from "dgram";
 
-import { read_address } from "./utils";
-import { Dest, MuxSession } from "./types";
+import { readAddress, readMetaAddress, writeMetaAddress } from "./utils";
+import { Dest, MuxSession, NameProtocols } from "./types";
 import { finished } from "stream";
 
-const PORT = parseInt(process.env.PORT ?? "1080")
+const PORT = parseInt(process.env.PORT ?? "3000")
 const UUID = validate(process.env.UUID ?? "") ?
-    process.env.UUID : v5(process.env.UUID!, Buffer.alloc(16))
+    process.env.UUID : v5(process.env.UUID ?? "inputyouruuid", Buffer.alloc(16))
 
-let start_index = Date.now()
+const WSPATH = process.env.WSPATH ?? ""
+
+let idHelper = 1
 
 const sessions = {} as Record<string, MuxSession>
 
-const wss = new WebSocketServer({ port: PORT,host:"0.0.0.0" })
+const wss = new WebSocketServer({ port: PORT, host: "0.0.0.0", path: WSPATH })
 
-wss.on("connection", (ws: WebSocket) => {
+let connecting = 0
+let lastConnecting = 0
 
-    ws.id = start_index++
-    ws.pendings = []
-    ws.next = head.bind(null, ws)
+wss.on("connection", (socket: WebSocket) => {
 
-    ws.on("message", (data: Buffer, isBinary) => {
-        ws.pendings.push(data)
-        ws.next()
+    connecting++
+
+    socket.id = idHelper++
+    socket.pendings = []
+    socket.next = head.bind(null, socket)
+    socket.setMaxListeners(100)
+
+    //@ts-ignore
+    // console.log("New connection from", socket.id, socket._socket.remoteAddress, socket._socket.remotePort)
+
+    socket.on("message", (data: Buffer, isBinary) => {
+        socket.pendings.push(data)
+        socket.next()
+    })
+
+    socket.on("error", () => {
+        socket.close()
+    })
+
+    socket.once("close", () => {
+        connecting--
+        // console.log("close", socket.id)
+    })
+
+    socket.once("close", () => {
+        const prefix = socket.id.toString()
+
+        for (const id in sessions) {
+            let session = sessions[id]
+            if (!id.startsWith(prefix)) {
+                continue
+            }
+            delete sessions[id]
+            session?.close?.()
+        }
     })
 })
 
-const protocol_type_to_name = {
-    1: "tcp",
-    2: "udp",
-    3: "mux"
-}
+setInterval(() => {
+    if (connecting != lastConnecting) {
+        console.log("Connections alive:", connecting)
+    }
+    lastConnecting = connecting
+}, 5000)
 
-const vless_success_resp = Buffer.from([0, 0])
+wss.on('error', (e: any) => {
+
+    if (e.code == 'EADDRINUSE') {
+        console.error(e)
+        //Retry
+        return
+    }
+
+    // if (proxy.server.force) {
+    //     return
+    // }
+});
+
+wss.on("listening", () => {
+    console.log(`listening on ${PORT},uuid:${UUID},path:${WSPATH}`)
+    console.log(`vless://${UUID}@127.0.0.1:${PORT}?host=localhost&path=${WSPATH}&type=ws&encryption=none&fp=random&sni=localhost#nvless`)
+    console.log("注意修改ip 域名 ")
+})
+
+
+// 仅在发送的时候才用到的buffer
+const BUFFER_META_RESERVE = Buffer.allocUnsafe(64)
+const BUFFER_LEN_RESERVE = Buffer.allocUnsafe(2)
+
+const BUFFER_SUCCESS_RESP = Buffer.from([0, 0])
 
 function head(socket: WebSocket) {
 
@@ -54,9 +112,9 @@ function head(socket: WebSocket) {
     const cmd = buffer[offset++] //18+optLength
 
     //@ts-ignore
-    let protocol = protocol_type_to_name[cmd!]
+    let protocol = NameProtocols[cmd!]
     if (protocol == null) {
-        console.error(new Error(`unsupported type:${cmd}`))
+        console.error("unsupported type:", cmd)
         socket.close()
         return
     }
@@ -66,59 +124,53 @@ function head(socket: WebSocket) {
         const ip = socket._socket.remoteAddress;
         //@ts-ignore
         const port = socket._socket.remotePort
-        console.error(new Error(`auth failed type:${cmd} ${ip}:${port}`))
+        console.error("auth failed type:", cmd, ip, port)
         socket.close()
         return
     }
 
-    if (protocol == "mux")        //mux
-    {
-        socket.pendings.push(buffer.subarray(offset))
+    if (protocol == "mux") {       //mux
+        const head = buffer.subarray(offset)
+        socket.pendings.push(head)
         socket.next = mux.bind(null, socket)
+        socket.send(BUFFER_SUCCESS_RESP)
         mux(socket)
         return
     }
 
-    const dest = {
-        host: "",
+    //@ts-ignore
+    const dest: Dest = {
         protocol,
-        port: buffer.readUInt16BE(offset) as unknown as number,
-        user: userid,
-        version: version!,
+        port: buffer.readUint16BE(offset),
     }
 
     offset += 2
+    offset = readAddress(buffer, dest, offset)
 
-    offset = read_address(buffer, dest, offset)
-    if (!dest.host) {
-        console.error(new Error(`invalid  addressType`))
+    if (!dest.host || dest.host.length == 0 || !dest.port) {
+        console.error("invalid  addressType:", dest.host, dest.port)
         socket.close()
         return
     }
 
-    // socket.pendings = null
     socket.removeAllListeners("message")
 
+    socket.send(BUFFER_SUCCESS_RESP)
+
     const head = buffer.subarray(offset)
-    if (head.length > 0) {
-        socket.pendings.unshift(head)
-    }
 
-    socket.send(vless_success_resp)
-
-    switch (cmd) {
-        case 0x01:      //tcp
-            tcp(socket, dest)
+    switch (dest.protocol) {
+        case "tcp":      //tcp
+            tcp(socket, dest, head)
             break
-        case 0x02:      //udp
-            udp(socket, dest)
+        case "udp":      //udp
+            udp(socket, dest, head)
             break
-        default:    //mux
-            console.error(new Error(`unsupported type:${cmd}`))
+        default:    //unknown
+            console.error("unsupported dest.protocol type", cmd)
             socket.close()
             break
     }
-
 }
 
 /**
@@ -128,7 +180,7 @@ function head(socket: WebSocket) {
  * @param at_least 要满足的最小数量
  * @returns 
  */
-function fetch(socket: WebSocket, at_least: number) {
+function fetch(socket: { pendings: Array<Buffer> }, at_least: number) {
     let total = 0
     for (let one of socket.pendings) {
         total += one.length
@@ -145,9 +197,8 @@ function fetch(socket: WebSocket, at_least: number) {
     let offset = 0
 
     while (socket.pendings.length > 0) {
-        let one = socket.pendings.shift()
-        one!.copy(buffer, offset, one!.length)
-        offset += one!.length
+        const one = socket.pendings.shift()
+        offset += one!.copy(buffer, offset, one!.length)
     }
 
     return buffer
@@ -157,18 +208,17 @@ function auth(_: WebSocket, uuid: string) {
     return uuid === UUID
 }
 
-function tcp(socket: WebSocket, dest: Dest) {
+function tcp(socket: WebSocket, dest: Dest, head: Buffer) {
 
-    if (!dest.host || !dest.port || dest.protocol != "tcp") {
-        console.error("cant socket to forward", dest.host, dest.port)
-        socket.close()
-        return
-    }
+    // console.log("connect to tcp", dest.host, dest.port)
 
-    const next = createConnection(dest)
+    const next = createConnection({ host: dest.host, port: dest.port }, () => {
+        console.log("tcp connected", socket.id, dest.host, dest.port)
+    })
 
     next.setKeepAlive(true)
     next.setNoDelay(true)
+    next.setTimeout(3000)
 
     const stream = createWebSocketStream(socket, {
         allowHalfOpen: false,   //可读端end的时候，调用可写端.end()了
@@ -178,10 +228,21 @@ function tcp(socket: WebSocket, dest: Dest) {
         writableObjectMode: false
     })
 
+    if (head.length > 0) {
+        // console.log("send head", socket.id, dest.host, dest.port)
+        // console.log(head.toString("utf8"))
+        stream.unshift(head)
+    }
+
     stream.pipe(next).pipe(stream)
 
+    next.on("error", (error) => {
+        console.error(socket.id, dest.host, dest.port, error)
+        next.destroySoon()
+    })
+
     const destroy = () => {
-        if (socket.OPEN) {
+        if (socket.readyState === WebSocket.OPEN) {
             socket.close()
         }
 
@@ -193,41 +254,81 @@ function tcp(socket: WebSocket, dest: Dest) {
     finished(stream, destroy)
 }
 
-function udp(socket: WebSocket, dest: Dest) {
+function udp(socket: WebSocket, dest: Dest, head: Buffer) {
 
-    if (!dest.host || !dest.port || dest.protocol != "udp") {
-        console.error("cant socket to forward udp", dest.host, dest.port)
-        socket.close()
-        return
+    const waiting = { pendings: [] } as { pendings: Buffer[] }
+
+    if (head.length > 0) {
+        waiting.pendings.push(head)
     }
 
-    const next = createSocket("udp4")
+    let connected = false
+    const target = createSocket("udp4")
 
-    next.connect(dest.port, dest.host)
+    function flushTarget() {
+        const buffer = fetch(waiting, 3)
+        if (buffer == null) {
+            return
+        }
+        const length = buffer.readUint16BE(0)
+        if (2 + length > buffer.length) {
+            waiting.pendings.push(buffer)
+            return
+        }
+        const end = 2 + length
+        target.send(buffer.subarray(2, end), dest.port, dest.host)
 
-    next.on("message", (data) => {
-        socket.send(data)
+        if (end < buffer.length) {
+            waiting.pendings.push(buffer.subarray(end))
+            flushTarget()
+        }
+    }
+
+    target.connect(dest.port, dest.host, () => {
+        connected = true
+        console.log("udp connected", dest.host, dest.port)
+        flushTarget()
     })
 
-    next.on("error", () => {
-        next.close()
-        socket.close()
+    target.on("message", (data) => {
+
+        //由于长度限制，这里要考虑分页
+        let offset = 0
+        const lenBuffer = BUFFER_LEN_RESERVE
+
+        //这里有问题，udp数据就应该完整弄过去的，但是uint16的长度有上限
+        while (offset < data.length) {
+            const len = Math.min(data.length - offset, 65535)
+            lenBuffer.writeUint16BE(len)
+            socket.send(lenBuffer)
+            socket.send(data.subarray(offset, offset += len))
+        }
     })
 
-    next.on("close", () => {
-        socket.close()
+    target.on("error", () => {
+        target.close()
+    })
+
+    target.once("close", () => {
+        connected = false
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.close()
+        }
     })
 
     socket.on("message", (data: Buffer) => {
-        next.send(data)
+        waiting.pendings.push(data)
+        if (connected) {
+            flushTarget()
+        }
     })
 
     socket.on("error", () => {
         socket.close()
     })
 
-    socket.on("close", () => {
-        next.close()
+    socket.once("close", () => {
+        target.close()
     })
 }
 function mux(socket: WebSocket) {
@@ -236,208 +337,232 @@ function mux(socket: WebSocket) {
     if (buffer == null) {
         return
     }
-    const meta_length = buffer.readUInt16BE()
 
-    if (meta_length < 4) {
+    let offset = 0
+    const metaLength = buffer.readUInt16BE(offset)
+
+    offset += 2
+
+    if (metaLength < 4) {
         socket.close()
         return
     }
 
-    if (2 + meta_length > buffer.length) {      //没有收全
+    if (offset + metaLength > buffer.length) {      //没有收全
         socket.pendings.push(buffer)
         return
     }
 
-    const meta = buffer.subarray(2, 2 + meta_length)
-    const type = meta[2]
+    const meta = buffer.subarray(offset, offset += metaLength)
+    const hasExtra = meta[3] == 1
 
-    const has_extra = meta[3] == 1
+    //额外数据开始的偏移
+    const extra_length = hasExtra ? buffer.readUInt16BE(offset) : 0
 
-    const extra_length_start = 2 + meta_length
-    const extra_length = has_extra ? buffer.readUInt16BE(extra_length_start) : 0
+    offset += hasExtra ? 2 : 0
 
-    if (has_extra && extra_length_start + 2 + extra_length > buffer.length) {
+    if (hasExtra && offset + extra_length > buffer.length) { //没有收全
         socket.pendings.push(buffer)
         return
     }
 
-    let extra: Buffer | undefined
-    let left: Buffer | undefined
+    const extra = hasExtra ? buffer.subarray(offset, offset += extra_length) : undefined
+    const left = offset < buffer.length ? buffer.subarray(offset) : undefined
 
-    if (has_extra) {
-        const extra_start = extra_length_start + 2
-        extra = buffer.subarray(extra_start, extra_start + extra_length)
-        left = buffer.subarray(extra_start + extra_length)
-    }
-    else {
-        left = buffer.subarray(2 + meta_length)
-    }
-
-    console.log("😈 recv mux cmd", socket.id, type)
-
-    switch (type) {
-        case 1:     //new
-            mux_new(socket, meta, extra)
-            break
-        case 2:
-            mux_keep(socket, meta, extra)
-            break
-        case 3:
-            mux_end(socket, meta, extra)
-            break
-        case 4:
-            mux_keepalive(socket, meta, extra)
-            break
-        default:
-            socket.close()
-            break
-    }
+    muxDispatch(socket, meta, extra)
 
     if (left && left.length > 0) {
-        console.log("😈 recv mux left > 0", socket.id, type)
+        // console.log("😈 recv mux left > 0", socket.id, type)
         socket.pendings.push(left)
         mux(socket)
     }
 }
 
-function mux_new(socket: WebSocket, meta: Buffer, extra?: Buffer) {
+function muxDispatch(socket: WebSocket, meta: Buffer, extra?: Buffer) {
 
-    //@ts-ignore
-    const session: MuxSession = sessions[session.id] = {
-        id: meta.readUInt16BE(),
-        dest: {
-            //@ts-ignore
-            protocol: protocol_type_to_name[meta[4]!],
-            port: meta.readUInt16BE(5),
-            host: "",       //Todo
-        }
-    }
+    const uid = meta.readUInt16BE()
+    const cmd = meta[2]
 
-    socket.on("error", () => {
-        socket.close()
-    })
-
-    socket.on("close", () => {
-        delete sessions[session.id]
-        session.close()
-    })
-
-    read_address(meta, session, 7)
-
-    if (!session.dest.host) {
-        socket.close()
-        console.error(new Error(`invalid addressType`))
+    if (cmd === 1) {        //创建
+        muxNew(socket, uid, meta, extra)
         return
     }
 
-    switch (session.dest.protocol) {
-        case "tcp":
-            {
-                const next = createConnection(session.dest)
-
-                next.setKeepAlive(true)
-                next.setNoDelay(true)
-
-                if (extra && extra.length > 0) {
-                    socket.send(extra)
-                }
-
-                next.on("message", (buffer: Buffer) => {
-                    sendClientKeep(socket, meta, buffer)
-                })
-                next.on("end", () => {
-                    if (socket.OPEN) {
-                        send_end_resp(socket, meta)
-                    }
-                    next.destroy()
-                })
-
-                next.on("error", () => {
-                    next.destroy()
-                })
-
-                next.on("close", () => {
-                    const deleted = delete sessions[session.id]
-
-                    if (deleted && socket.OPEN) {
-                        send_end_resp(socket, meta)
-                    }
-                })
-
-                session.send = (data: Buffer) => {
-                    if (next.writable) {
-                        next.write(data)
-                    }
-                }
-                session.close = () => {
-                    if (next.writable) {
-                        next.destroy()
-                    }
-                }
-            }
-            break
-        case "udp":
-            {
-                const next = createSocket("udp4")
-
-                next.connect(session.dest.port, session.dest.host)
-
-                next.on("message", (data) => {
-                    sendClientKeep(socket,meta,data)
-                })
-
-                next.on("error", () => {
-                    next.close()
-                    socket.close()
-                })
-                
-                next.on("close", () => {
-                    const deleted = delete sessions[session.id]
-
-                    if (deleted && socket.OPEN) {
-                        send_end_resp(socket, meta)
-                    }                
-                })
-
-                session.send = (data: Buffer) => {
-                    next.send(data)
-                }
-
-                session.close = () => {
-                    next.disconnect()
-                }
-            }
-    }
-}
-
-function mux_keep(socket: WebSocket, meta: Buffer, extra?: Buffer) {
-
-    const id = meta.readUInt16BE().toString()
+    const id = `${socket.id}/${uid}`
     const session = sessions[id]
 
     if (!session) {
-        send_end_resp(socket, meta)
+        sendClientEnd(socket, meta)
         return
     }
+
+    switch (cmd) {
+        case 2:
+            muxKeep(socket, session, meta, extra)
+            break
+        case 3:
+            muxEnd(socket, session, meta, extra)
+            break
+        case 4:
+            muxKeepAlive(socket, session, meta, extra)
+            break
+        default:
+            socket.close()
+            break
+    }
+}
+
+function muxNew(socket: WebSocket, uid: number, meta: Buffer, extra?: Buffer) {
+
+    const dest: Dest = readMetaAddress(meta)
+    const id = `${socket.id}/${uid}`
+
+    if (!dest.host || dest.port === 0) {
+        sendClientEnd(socket, meta)
+        console.error("invalid mux new addressType:", dest.protocol, id, dest.host, dest.port)
+        return
+    }
+
+    console.log("😈 mux new", dest.protocol, id, dest.host, dest.port)
+
+    //@ts-ignore
+    const session: MuxSession = sessions[id] = {
+        id,
+        uid,
+        dest
+    }
+
+    switch (dest.protocol) {
+        case "tcp":
+            muxNewTcp(socket, session, meta)
+            break
+        case "udp":
+            muxNewUdp(socket, session, meta)
+            break
+        default:
+            socket.close()
+            return
+    }
+
+    if (extra && extra.length > 0) {
+        muxKeep(socket, session, meta, extra)
+    }
+}
+
+function muxNewTcp(socket: WebSocket, session: MuxSession, meta: Buffer) {
+
+    const target = createConnection({ host: session.dest.host, port: session.dest.port }, () => {
+        console.log("mux tcp connected", session.id, session.dest.host, session.dest.port)
+    })
+
+    target.setKeepAlive(true)
+    target.setNoDelay(true)
+    target.setTimeout(3000)
+
+    target.on("data", (buffer: Buffer) => {
+        // console.log("-----------recv-----------")
+        // console.log(buffer.toString("utf8"))
+
+        sendClientTcpKeep(socket, meta, buffer)
+    })
+    target.on("end", () => {
+        target.destroy()
+    })
+
+    target.on("error", () => {
+        target.destroy()
+    })
+
+    target.once("close", () => {
+        const deleted = delete sessions[session.id]
+        if (deleted) {
+            sendClientEnd(socket, meta)
+        }
+    })
+
+    session.send = (data: Buffer) => {
+        if (target.writable) {
+            target.write(data)
+        }
+    }
+    session.close = () => {
+        if (target.writable) {
+            target.destroySoon()
+        }
+    }
+}
+
+function muxNewUdp(socket: WebSocket, session: MuxSession, meta: Buffer) {
+
+    let alreadyClose = false
+    let last = Date.now()
+
+    const target = createSocket("udp4")
+
+    target.bind()
+    target.on("message", (data, rinfo: RemoteInfo) => {
+        last = Date.now()
+
+        // console.log("send client mux keep udp", session.id, rinfo.address, rinfo.port)
+        sendClientUdpKeep(socket, meta, rinfo, data)
+    })
+
+    target.on("error", () => {
+        target.close()
+    })
+
+    const timer = setInterval(() => {
+        if (Date.now() - last < 30000) {
+            return
+        }
+        if (!alreadyClose) {
+            target.close()
+        }
+    }, 10000)
+
+    target.once("close", () => {
+        alreadyClose = true
+        clearInterval(timer)
+        const deleted = delete sessions[session.id]
+        if (deleted) {
+            sendClientEnd(socket, meta)
+        }
+    })
+
+    session.send = (msg: Buffer, port: number, host: string) => {
+        last = Date.now()
+        //@ts-ignore
+        target.send(msg, port, host)
+    }
+
+    session.close = () => {
+        if (!alreadyClose) {
+            target.close()
+        }
+    }
+}
+
+function muxKeep(socket: WebSocket, session: MuxSession, meta: Buffer, extra?: Buffer) {
+
     if (!extra || extra.length == 0) {
         return
     }
 
-    session.send(extra)
-}
-
-function mux_end(socket: WebSocket, meta: Buffer, extra?: Buffer) {
-
-    const id = meta.readUInt16BE().toString()
-
-    const session = sessions[id]
-    if (session == null) {
+    if (session.dest.protocol === "tcp") {
+        session.send(extra)
         return
     }
 
-    delete sessions[id]
+    const dest = readMetaAddress(meta)
 
-    console.log("mux end", socket.id, id, session.dest.host)
+    session.send(extra, dest.port, dest.host)
+}
+
+function muxEnd(socket: WebSocket, session: MuxSession, meta: Buffer, extra?: Buffer) {
+
+    delete sessions[session.id]
+
+    console.log("mux end", session.dest.protocol, session.id, session.dest.host, session.dest.port)
 
     if (extra) {
         session.send(extra)
@@ -445,39 +570,123 @@ function mux_end(socket: WebSocket, meta: Buffer, extra?: Buffer) {
     session.close()
 }
 
-function mux_keepalive(socket: WebSocket, meta: Buffer, extra?: Buffer) { }
+function muxKeepAlive(socket: WebSocket, session: MuxSession, meta: Buffer, extra?: Buffer) {
 
-function sendClientKeep(socket: WebSocket, originMeta: Buffer, extra: Buffer) {
+    /**
+     * 保持连接 (KeepAlive)
+        2 字节	1 字节	1 字节
+        ID	0x04	选项 Opt
+        在保持连接时:
+ 
+        若 Opt(D) 开启，则这一帧所带的数据必须被丢弃。
+        ID 可为随机值。
+        #应用
+     */
+
+    const id = `${socket.id}/${meta.readUInt16BE()}`
+
+    console.log("mux keepAlive", id)
+}
+
+function sendClientTcpKeep(socket: WebSocket, originMeta: Buffer, extra: Buffer) {
+
+    if (socket.readyState !== WebSocket.OPEN) {
+        return
+    }
 
     const meta = originMeta.subarray(0, 4)
 
-    meta[2] = 2
-    meta[3] = 1
+    //[0][1] = id
+    meta[2] = 2     //cmd
+    meta[3] = 1     //hasExtra 
 
-    const resp = Buffer.alloc(2 + meta.length + 2)
+    if (extra.length < 65535) {
+        sendClientMuxData(socket, meta, extra)
+        return
+    }
 
-    resp.writeUint16BE(meta.length)
-    meta.copy(resp, 2)
-
-    resp.writeUint16BE(extra.length, meta.length + 2)
-
-    socket.send(resp)
-    socket.send(extra)
+    //由于长度限制，这里要考虑分页
+    let offset = 0
+    while (offset < extra.length) {
+        const len = Math.min(extra.length - offset, 65535)
+        sendClientMuxData(socket, meta, extra.subarray(offset, offset += len))
+    }
 }
 
-function send_end_resp(socket: WebSocket, originMeta: Buffer) {
+function sendClientUdpKeep(socket: WebSocket, originMeta: Buffer, rinfo: RemoteInfo, extra: Buffer) {
 
-    console.log("😢 send mux end", socket.id, socket.id)
+    if (socket.readyState !== WebSocket.OPEN) {
+        return
+    }
+
+    const preparedMeta = BUFFER_META_RESERVE
+
+    //id
+    preparedMeta[0] = originMeta[0]!
+    preparedMeta[1] = originMeta[1]!
+
+    preparedMeta[2] = 2     //cmd
+    preparedMeta[3] = 1     //hasExtra 
+
+    const dest: Dest = {
+        port: rinfo.port,
+        host: rinfo.address,
+        protocol: "udp",
+        //@ts-ignore
+        family: rinfo.family.toLowerCase(),
+    }
+
+    const metaLength = writeMetaAddress(preparedMeta, dest, 4)
+    const meta = preparedMeta.subarray(0, metaLength)
+
+    if (extra.length < 65535) {
+        sendClientMuxData(socket, meta, extra)
+        return
+    }
+
+    //由于长度限制，这里要考虑分页
+    let offset = 0
+    while (offset < extra.length) {
+        const len = Math.min(extra.length - offset, 65535)
+        sendClientMuxData(socket, meta, extra.subarray(offset, offset += len))
+    }
+}
+
+function sendClientMuxData(socket: WebSocket, meta: Buffer, data: Buffer) {
+
+    //meta.length(2) + meta(meta.length) + data.length(2) + data(data.length)
+
+    const lenBuffer = BUFFER_LEN_RESERVE
+
+    lenBuffer.writeUint16BE(meta.length)
+
+    socket.send(lenBuffer)
+    socket.send(meta)
+
+    lenBuffer.writeUint16BE(data.length)
+
+    socket.send(lenBuffer)
+    socket.send(data)
+}
+
+function sendClientEnd(socket: WebSocket, originMeta: Buffer) {
+
+    if (socket.readyState !== WebSocket.OPEN) {
+        return
+    }
+
+    // console.log("😢 send mux end", id)
 
     const meta = originMeta.subarray(0, 4)
 
     meta[2] = 3     //type
     meta[3] = 0     //has_opt
 
-    const resp = Buffer.allocUnsafe(2)
-    resp.writeUint16BE(meta.length)
+    const lenBuffer = BUFFER_LEN_RESERVE
 
-    socket.send(resp)
+    lenBuffer.writeUint16BE(meta.length)
+
+    socket.send(lenBuffer)
     socket.send(meta)
 }
 

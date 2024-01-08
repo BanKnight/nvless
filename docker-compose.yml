@@ -1,7 +1,7 @@
 version: '3'
 services:
   nvless:
-    image: ghcr.io/banknight/nvless:main
+    image: ghcr.io/banknight/nvless
     container_name: nvless
     restart: always
     ports:

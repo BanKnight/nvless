@@ -31,7 +31,7 @@ wss.on("connection", (socket: WebSocket) => {
     socket.next = head.bind(null, socket)
     socket.setMaxListeners(100)
 
-    //@ts-ignore
+    // @ts-ignore
     // console.log("New connection from", socket.id, socket._socket.remoteAddress, socket._socket.remotePort)
 
     socket.on("message", (data: Buffer, isBinary) => {
@@ -553,7 +553,7 @@ function muxKeep(socket: WebSocket, session: MuxSession, meta: Buffer, extra?: B
         return
     }
 
-    const dest = readMetaAddress(meta)
+    const dest = session.dest
 
     session.send(extra, dest.port, dest.host)
 }
@@ -628,15 +628,16 @@ function sendClientUdpKeep(socket: WebSocket, originMeta: Buffer, rinfo: RemoteI
     preparedMeta[2] = 2     //cmd
     preparedMeta[3] = 1     //hasExtra 
 
-    const dest: Dest = {
-        port: rinfo.port,
-        host: rinfo.address,
-        protocol: "udp",
-        //@ts-ignore
-        family: rinfo.family.toLowerCase(),
-    }
+    // const dest: Dest = {
+    //     port: rinfo.port,
+    //     host: rinfo.address,
+    //     protocol: "udp",
+    //     //@ts-ignore
+    //     family: rinfo.family.toLowerCase(),
+    // }
 
-    const metaLength = writeMetaAddress(preparedMeta, dest, 4)
+    // const metaLength = writeMetaAddress(preparedMeta, dest, 4)
+    const metaLength = 4
     const meta = preparedMeta.subarray(0, metaLength)
 
     if (extra.length < 65535) {

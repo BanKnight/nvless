@@ -1,3 +1,5 @@
+
+
 ## nvless
 
 一个用typescript实现的只使用ws链接的vless协议服务端。
@@ -59,5 +61,5 @@ location = /nvless {
 npm install
 
 # 启动服务
-npm run test
+npm run dev
 ```
